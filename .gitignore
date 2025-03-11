@@ -1,0 +1,19 @@
+# Virtual Environment
+chess_env/
+chess_env/*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Generated files
+*.gexf
+*.png
+
+# Chess files
+*.pgn
+*.zst
+
+# macOS system files
+.DS_Store 
