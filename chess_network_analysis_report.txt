@@ -1,0 +1,7 @@
+CHESS NETWORK ANALYSIS REPORT
+============================
+
+Total moves analyzed: 842
+Total transitions: 3156
+Most popular move: O-O
+Communities detected: 42

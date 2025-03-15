@@ -1,271 +1,382 @@
-import chess.pgn
 import networkx as nx
 import matplotlib.pyplot as plt
-from analyze import pgn_file
+import pandas as pd
+import numpy as np
+import chess.pgn
+import io
+import seaborn as sns
+from collections import defaultdict
+from community import community_louvain
 
-def build_move_network(pgn_file, max_games=20):
-    G = nx.DiGraph()  # Directed graph for move transitions
 
-    with open(pgn_file, encoding="utf-8") as file:
-        game_count = 0
+class ChessNetwork:
+    def __init__(self):
+        """Initialize the chess network graph."""
+        self.G = nx.DiGraph()
+        self.positions_map = {}  # Maps FEN positions to node IDs
+        self.node_counter = 0
+        self.games_analyzed = 0
 
-        while game_count < max_games:
-            game = chess.pgn.read_game(file)
-            if game is None:
-                break
+    def add_game(self, pgn_text):
+        """
+        Parse a PGN game and add its moves to the network.
+        
+        Args:
+            pgn_text (str): Chess game in PGN format
+        """
+        pgn = io.StringIO(pgn_text)
+        game = chess2.pgn.read_game(pgn)
+        
+        if game is None:
+            return False
+        
+        self.games_analyzed += 1
+        
+        # Track the board position
+        board = game.board()
+        current_position = board.fen().split(' ')[0]  # Only use piece positions part of FEN
+        
+        # Add initial position if not already in the graph
+        if current_position not in self.positions_map:
+            self.positions_map[current_position] = self.node_counter
+            self.G.add_node(self.node_counter, fen=current_position, visits=1)
+            self.node_counter += 1
+        else:
+            # Increment visits for this position
+            node_id = self.positions_map[current_position]
+            self.G.nodes[node_id]['visits'] += 1
+        
+        # Process each move in the game
+        for move in game.mainline_moves():
+            source_node = self.positions_map[current_position]
+            
+            # Make the move on the board
+            board.push(move)
+            new_position = board.fen().split(' ')[0]
+            
+            # Add new position if not already in the graph
+            if new_position not in self.positions_map:
+                self.positions_map[new_position] = self.node_counter
+                self.G.add_node(self.node_counter, fen=new_position, visits=1)
+                self.node_counter += 1
+            else:
+                # Increment visits for this position
+                node_id = self.positions_map[new_position]
+                self.G.nodes[node_id]['visits'] += 1
+            
+            target_node = self.positions_map[new_position]
+            
+            # Add or update the edge
+            if self.G.has_edge(source_node, target_node):
+                self.G[source_node][target_node]['weight'] += 1
+            else:
+                self.G.add_edge(source_node, target_node, weight=1, move=move.uci())
+            
+            current_position = new_position
+        
+        return True
 
-            game_count += 1
-            if game_count % 500 == 0:
-                print(f"Processed {game_count} games")
+    def load_pgn_file(self, file_path, max_games=None):
+        """
+        Load games from a PGN file and add them to the network.
+        
+        Args:
+            file_path (str): Path to the PGN file
+            max_games (int, optional): Maximum number of games to load
+        """
+        games_loaded = 0
+        
+        with open(file_path, 'r') as f:
+            pgn_text = ""
+            for line in f:
+                pgn_text += line
+                
+                # Empty line might indicate end of a game
+                if line.strip() == "" and pgn_text.strip() != "":
+                    if "1." in pgn_text:  # Simple check to see if there are moves
+                        if self.add_game(pgn_text):
+                            games_loaded += 1
+                            if max_games and games_loaded >= max_games:
+                                break
+                    pgn_text = ""
+        
+        print(f"Loaded {games_loaded} games into the network")
+        print(f"Network has {len(self.G.nodes)} positions and {len(self.G.edges)} transitions")
+        
+    def calculate_metrics(self):
+        """Calculate various network metrics and add them as node attributes."""
+        print("Calculating network metrics...")
+        
+        # Degree Centrality
+        in_degree = dict(self.G.in_degree(weight='weight'))
+        out_degree = dict(self.G.out_degree(weight='weight'))
+        
+        # Add degree metrics to nodes
+        for node in self.G.nodes():
+            self.G.nodes[node]['in_degree'] = in_degree.get(node, 0)
+            self.G.nodes[node]['out_degree'] = out_degree.get(node, 0)
+            self.G.nodes[node]['total_degree'] = in_degree.get(node, 0) + out_degree.get(node, 0)
+        
+        # Betweenness Centrality (can be computationally expensive for large networks)
+        if len(self.G) < 10000:  # Only calculate for smaller networks
+            print("Calculating betweenness centrality...")
+            betweenness = nx.betweenness_centrality(self.G, weight='weight', k=min(100, len(self.G)))
+            nx.set_node_attributes(self.G, betweenness, 'betweenness')
+        
+        # Clustering Coefficient (for undirected version of the graph)
+        print("Calculating clustering coefficients...")
+        G_undirected = self.G.to_undirected()
+        clustering = nx.clustering(G_undirected, weight='weight')
+        nx.set_node_attributes(self.G, clustering, 'clustering')
+        
+        # Community Detection
+        print("Detecting communities...")
+        communities = community_louvain.best_partition(G_undirected)
+        nx.set_node_attributes(self.G, communities, 'community')
+        
+        print("Metrics calculation complete")
 
-            # Extract move sequence
-            node = game
-            previous_move = None
-            board = node.board()
+    def get_top_positions(self, metric='visits', n=10):
+        """
+        Get the top positions based on a specified metric.
+        
+        Args:
+            metric (str): The metric to sort by ('visits', 'in_degree', 'out_degree', 'betweenness', etc.)
+            n (int): Number of positions to return
+            
+        Returns:
+            DataFrame: Top positions with their metrics
+        """
+        nodes_data = []
+        for node, data in self.G.nodes(data=True):
+            if metric in data:
+                nodes_data.append({
+                    'node_id': node,
+                    'fen': data.get('fen', ''),
+                    metric: data.get(metric, 0),
+                    'visits': data.get('visits', 0),
+                    'in_degree': data.get('in_degree', 0),
+                    'out_degree': data.get('out_degree', 0),
+                    'betweenness': data.get('betweenness', 0),
+                    'clustering': data.get('clustering', 0),
+                    'community': data.get('community', -1)
+                })
+        
+        df = pd.DataFrame(nodes_data)
+        return df.sort_values(by=metric, ascending=False).head(n)
 
-            for move in node.mainline_moves():
-                san_move = board.san(move)
-                board.push(move)
+    def get_common_transitions(self, n=10):
+        """
+        Get the most common position transitions.
+        
+        Args:
+            n (int): Number of transitions to return
+            
+        Returns:
+            DataFrame: Top transitions with their weights
+        """
+        edges_data = []
+        for u, v, data in self.G.edges(data=True):
+            edges_data.append({
+                'source': u,
+                'target': v,
+                'weight': data.get('weight', 0),
+                'move': data.get('move', ''),
+                'source_fen': self.G.nodes[u].get('fen', ''),
+                'target_fen': self.G.nodes[v].get('fen', '')
+            })
+        
+        df = pd.DataFrame(edges_data)
+        return df.sort_values(by='weight', ascending=False).head(n)
 
-                # Create transitions between consecutive moves
-                if previous_move:
-                    if G.has_edge(previous_move, san_move):
-                        G[previous_move][san_move]['weight'] += 1
+    def find_shortest_paths(self, start_fen, end_fen, k=3):
+        """
+        Find the k shortest paths between two positions.
+        
+        Args:
+            start_fen (str): Starting position in FEN format
+            end_fen (str): Ending position in FEN format
+            k (int): Number of paths to find
+            
+        Returns:
+            list: List of paths (each path is a list of node IDs)
+        """
+        if start_fen not in self.positions_map or end_fen not in self.positions_map:
+            return []
+        
+        start_node = self.positions_map[start_fen]
+        end_node = self.positions_map[end_fen]
+        
+        try:
+            paths = list(nx.shortest_simple_paths(self.G, start_node, end_node, weight='weight'))
+            return paths[:k]
+        except nx.NetworkXNoPath:
+            return []
+
+    def visualize_network(self, max_nodes=100, metric='visits', min_edge_weight=2):
+        """
+        Visualize the chess network.
+        
+        Args:
+            max_nodes (int): Maximum number of nodes to display
+            metric (str): Metric to determine node size
+            min_edge_weight (int): Minimum edge weight to display
+        """
+        # Create a subgraph with the top nodes by the specified metric
+        top_nodes = self.get_top_positions(metric=metric, n=max_nodes)['node_id'].tolist()
+        subgraph = self.G.subgraph(top_nodes)
+        
+        # Filter edges by minimum weight
+        edges_to_keep = [(u, v) for u, v, d in subgraph.edges(data=True) if d.get('weight', 0) >= min_edge_weight]
+        filtered_graph = subgraph.edge_subgraph(edges_to_keep)
+        
+        # Set up the plot
+        plt.figure(figsize=(12, 10))
+        
+        # Node sizes based on the metric
+        node_sizes = [filtered_graph.nodes[n].get(metric, 1) * 10 for n in filtered_graph.nodes()]
+        
+        # Node colors based on community
+        node_colors = [filtered_graph.nodes[n].get('community', 0) for n in filtered_graph.nodes()]
+        
+        # Edge weights for thickness
+        edge_weights = [filtered_graph[u][v].get('weight', 1) / 2 for u, v in filtered_graph.edges()]
+        
+        # Create the layout
+        pos = nx.spring_layout(filtered_graph, seed=42)
+        
+        # Draw the network
+        nx.draw_networkx_nodes(filtered_graph, pos, node_size=node_sizes, node_color=node_colors, 
+                              cmap=plt.cm.viridis, alpha=0.8)
+        nx.draw_networkx_edges(filtered_graph, pos, width=edge_weights, alpha=0.5, 
+                              edge_color='gray', arrows=True, arrowsize=10)
+        
+        plt.title(f"Chess Position Network (showing top {len(filtered_graph)} positions by {metric})")
+        plt.axis('off')
+        plt.tight_layout()
+        
+        return plt
+
+    def plot_degree_distribution(self):
+        """Plot the degree distribution of the network."""
+        degrees = [d for n, d in self.G.degree()]
+        
+        plt.figure(figsize=(10, 6))
+        plt.hist(degrees, bins=30, alpha=0.7)
+        plt.xlabel('Degree')
+        plt.ylabel('Frequency')
+        plt.title('Degree Distribution')
+        plt.grid(True, alpha=0.3)
+        
+        return plt
+
+    def plot_community_sizes(self):
+        """Plot the distribution of community sizes."""
+        communities = nx.get_node_attributes(self.G, 'community')
+        if not communities:
+            print("No community data available. Run calculate_metrics() first.")
+            return None
+        
+        community_sizes = defaultdict(int)
+        for community_id in communities.values():
+            community_sizes[community_id] += 1
+        
+        # Convert to DataFrame for plotting
+        df = pd.DataFrame({
+            'Community': list(community_sizes.keys()),
+            'Size': list(community_sizes.values())
+        }).sort_values('Size', ascending=False)
+        
+        plt.figure(figsize=(12, 6))
+        sns.barplot(x='Community', y='Size', data=df.head(20))
+        plt.title('Top 20 Community Sizes')
+        plt.xticks(rotation=45)
+        plt.tight_layout()
+        
+        return plt
+
+    def plot_heatmap(self, metric='visits'):
+        """
+        Create a heatmap visualization of the chess board with positions colored by a metric.
+        
+        Args:
+            metric (str): Metric to use for coloring ('visits', 'in_degree', etc.)
+        """
+        # Get top positions
+        top_positions = self.get_top_positions(metric=metric, n=100)
+        
+        # Create an 8x8 grid for the chess board
+        heatmap_data = np.zeros((8, 8))
+        
+        for _, row in top_positions.iterrows():
+            fen = row['fen']
+            value = row[metric]
+            
+            # Parse FEN to get piece positions
+            ranks = fen.split('/')
+            for rank_idx, rank in enumerate(ranks):
+                file_idx = 0
+                for char in rank:
+                    if char.isdigit():
+                        file_idx += int(char)
                     else:
-                        G.add_edge(previous_move, san_move, weight=1)
-
-                previous_move = san_move  # Update previous move
-
-    return G
-
-def build_position_network(pgn_file, max_games=20):
-    """Build a network where nodes are board positions and edges are moves between them"""
-    G = nx.DiGraph()  # Directed graph for position transitions
-    
-    with open(pgn_file, encoding="utf-8") as file:
-        game_count = 0
+                        # Add the value to the corresponding square
+                        if file_idx < 8 and rank_idx < 8:  # Ensure within bounds
+                            heatmap_data[rank_idx][file_idx] += value
+                        file_idx += 1
         
-        while game_count < max_games:
-            game = chess.pgn.read_game(file)
-            if game is None:
-                break
-                
-            game_count += 1
-            if game_count % 500 == 0:
-                print(f"Processed {game_count} games")
-                
-            # Track game outcome for later analysis
-            result = game.headers.get("Result", "*")
-            
-            # Extract position sequence
-            board = game.board()
-            previous_position = board.fen().split(' ')[0]  # Just the position part of FEN
-            
-            for move in game.mainline_moves():
-                san_move = board.san(move)
-                board.push(move)
-                current_position = board.fen().split(' ')[0]
-                
-                # Add nodes if they don't exist
-                if not G.has_node(previous_position):
-                    G.add_node(previous_position, visits=1)
-                else:
-                    G.nodes[previous_position]['visits'] += 1
-                    
-                if not G.has_node(current_position):
-                    G.add_node(current_position, visits=1)
-                else:
-                    G.nodes[current_position]['visits'] += 1
-                
-                # Create transitions between positions
-                if G.has_edge(previous_position, current_position):
-                    G[previous_position][current_position]['weight'] += 1
-                else:
-                    G.add_edge(previous_position, current_position, 
-                              weight=1, 
-                              move=san_move)
-                
-                previous_position = current_position
-                
-    return G
-
-def analyze_move_network(G):
-    print("\n--- Move Network Analysis ---")
-    
-    # 1. Centrality Measures
-    print("Calculating centrality measures...")
-    # Adjust k to be the minimum of 500 or the number of nodes
-    k = min(500, len(G.nodes()))
-    betweenness = nx.betweenness_centrality(G, weight='weight', k=k)
-    in_degree = dict(G.in_degree())
-    out_degree = dict(G.out_degree())
-
-    # Find most influential move
-    most_influential = max(betweenness, key=betweenness.get)
-    print(f"Most Influential Move (Betweenness Centrality): {most_influential} (Score: {betweenness[most_influential]:.4f})")
-    
-    # Find most popular move
-    most_popular = max(in_degree, key=in_degree.get)
-    print(f"Most Popular Move (In-Degree Centrality): {most_popular} (In-Degree: {in_degree[most_popular]})")
-    
-    # Find move leading to the most variations
-    most_variations = max(out_degree, key=out_degree.get)
-    print(f"Move Leading to Most Variations (Out-Degree Centrality): {most_variations} (Out-Degree: {out_degree[most_variations]})")
-
-    # 2. Clustering Coefficient
-    print("Calculating clustering coefficient...")
-    try:
-        # Convert to undirected for clustering coefficient
-        G_undirected = G.to_undirected()
-        clustering = nx.clustering(G_undirected)
-        avg_clustering = nx.average_clustering(G_undirected)
-        print(f"Average Clustering Coefficient: {avg_clustering:.4f}")
+        # Plot the heatmap
+        plt.figure(figsize=(10, 10))
+        sns.heatmap(heatmap_data, cmap='YlOrRd', annot=False)
+        plt.title(f'Chess Board Heatmap by {metric}')
+        plt.xlabel('File (a-h)')
+        plt.ylabel('Rank (1-8)')
+        plt.xticks(np.arange(8) + 0.5, ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'])
+        plt.yticks(np.arange(8) + 0.5, ['8', '7', '6', '5', '4', '3', '2', '1'])
         
-        # Find moves with highest clustering (most interconnected)
-        most_clustered = max(clustering, key=clustering.get)
-        print(f"Most Interconnected Move: {most_clustered} (Clustering: {clustering[most_clustered]:.4f})")
-    except Exception as e:
-        print(f"Clustering calculation error: {e}")
-    
-    # 3. Shortest Path Analysis
-    print("Analyzing shortest paths...")
-    try:
-        # Sample some nodes for path analysis (full analysis would be too computationally expensive)
-        sample_nodes = list(G.nodes())[:min(100, len(G.nodes()))]
-        avg_path_length = nx.average_shortest_path_length(G, weight='weight')
-        print(f"Average Shortest Path Length: {avg_path_length:.4f}")
-    except Exception as e:
-        print(f"Path analysis error: {e}")
-    
-    # 4. Community Detection
-    print("Detecting communities...")
-    try:
-        # Convert to undirected for community detection
-        G_undirected = G.to_undirected()
-        communities = nx.community.greedy_modularity_communities(G_undirected)
-        print(f"Number of move communities detected: {len(communities)}")
-        
-        # Print largest communities (opening/strategy clusters)
-        for i, community in enumerate(list(communities)[:3]):
-            print(f"Community {i+1} size: {len(community)} moves")
-            print(f"Sample moves: {list(community)[:5]}")
-    except Exception as e:
-        print(f"Community detection error: {e}")
+        return plt
 
-    return betweenness, in_degree, out_degree
 
-def visualize_move_network(G, betweenness, in_degree, out_degree):
-    print("Generating network visualization...")
-    
-    # Extract node sizes based on in-degree centrality
-    node_sizes = [in_degree.get(node, 0) * 10 for node in G]  # Scale size for visibility
-
-    # Limit visualization to most significant nodes for clarity
-    if len(G) > 200:
-        # Create a subgraph of the most important nodes
-        significant_nodes = sorted(in_degree, key=in_degree.get, reverse=True)[:200]
-        G_viz = G.subgraph(significant_nodes)
-        node_sizes = [in_degree.get(node, 0) * 10 for node in G_viz]
-    else:
-        G_viz = G
-
-    # Draw the graph
-    plt.figure(figsize=(15, 15))
-    pos = nx.spring_layout(G_viz, seed=42)
-    
-    # Draw nodes with size based on in-degree
-    nx.draw(G_viz, pos, with_labels=True, node_size=node_sizes, 
-            edge_color='gray', font_size=8, arrowsize=10, alpha=0.7)
-
-    # Highlight key moves
-    key_nodes = []
-    if betweenness:
-        most_influential = max(betweenness, key=betweenness.get)
-        if most_influential in G_viz:
-            key_nodes.append(('Most Influential', most_influential, 'red'))
-    
-    if in_degree:
-        most_popular = max(in_degree, key=in_degree.get)
-        if most_popular in G_viz:
-            key_nodes.append(('Most Popular', most_popular, 'blue'))
-    
-    if out_degree:
-        most_variations = max(out_degree, key=out_degree.get)
-        if most_variations in G_viz:
-            key_nodes.append(('Most Variations', most_variations, 'green'))
-    
-    # Draw highlighted nodes
-    for label, node, color in key_nodes:
-        nx.draw_networkx_nodes(G_viz, pos, nodelist=[node], node_color=color, 
-                              node_size=in_degree.get(node, 5) * 15)
-    
-    # Add legend
-    legend_elements = [plt.Line2D([0], [0], marker='o', color='w', 
-                                 markerfacecolor=color, markersize=10, label=label)
-                      for label, _, color in key_nodes]
-    plt.legend(handles=legend_elements, loc="upper right")
-    
-    plt.title("Chess Move Network")
-    plt.savefig("chess_move_network.png", dpi=300)
-    plt.show()
-
-def visualize_position_network(G, top_n=100):
-    """Visualize the top N most visited positions in the network"""
-    print("Generating position network visualization...")
-    
-    # Extract the most common positions
-    positions_by_visits = sorted(G.nodes(data=True), 
-                               key=lambda x: x[1].get('visits', 0), 
-                               reverse=True)[:top_n]
-    
-    # Create a subgraph of just these positions
-    sub_G = G.subgraph([p[0] for p in positions_by_visits])
-    
-    # Draw the graph
-    plt.figure(figsize=(15, 15))
-    pos = nx.spring_layout(sub_G, seed=42)
-    
-    # Node sizes based on visit count
-    node_sizes = [sub_G.nodes[node].get('visits', 1)/5 for node in sub_G]
-    
-    # Edge widths based on weight
-    edge_widths = [sub_G[u][v].get('weight', 1)/10 for u, v in sub_G.edges()]
-    
-    nx.draw(sub_G, pos, with_labels=False, node_size=node_sizes, 
-           width=edge_widths, edge_color='gray', alpha=0.7)
-    
-    # Add labels for the top 10 positions
-    top_positions = [p[0] for p in positions_by_visits[:10]]
-    labels = {pos: f"Pos {i+1}" for i, pos in enumerate(top_positions)}
-    nx.draw_networkx_labels(sub_G, pos, labels=labels, font_size=12)
-    
-    plt.title("Chess Position Network (Top Positions)")
-    plt.savefig("chess_position_network.png", dpi=300)
-    plt.show()
-
-# Main execution
+# Example usage
 if __name__ == "__main__":
-    # Build the move-based network
-    print("Building move network...")
-    G_moves = build_move_network(pgn_file, max_games=20)
-    print("Move Network construction complete.")
-
-    # Analyze the move-based network
-    betweenness, in_degree, out_degree = analyze_move_network(G_moves)
-
-    # Visualize the move-based network
-    visualize_move_network(G_moves, betweenness, in_degree, out_degree)
+    # Create a chess network
+    chess_net = ChessNetwork()
     
-    # Build the position-based network
-    print("\nBuilding position network...")
-    G_positions = build_position_network(pgn_file, max_games=20)
-    print("Position Network construction complete.")
+    # Load games from your existing PGN file
+    print("Loading games from PGN file...")
+    chess_net.load_pgn_file(pgn_file, max_games=50)  # Using 50 games for faster analysis
     
-    # Visualize the position network
-    visualize_position_network(G_positions, top_n=100)
+    # Calculate network metrics
+    chess_net.calculate_metrics()
     
-    # Save networks for future analysis
-    print("Saving networks to files...")
-    nx.write_gexf(G_moves, "chess_move_network.gexf")
-    nx.write_gexf(G_positions, "chess_position_network.gexf")
-    print("Analysis complete!")
+    # Get top positions by visits
+    top_positions = chess_net.get_top_positions(metric='visits', n=10)
+    print("\nTop positions by visits:")
+    print(top_positions[['fen', 'visits', 'in_degree', 'out_degree']])
+    
+    # Get most common transitions
+    common_transitions = chess_net.get_common_transitions(n=10)
+    print("\nMost common transitions:")
+    print(common_transitions[['move', 'weight']])
+    
+    # Generate visualizations
+    print("\nGenerating visualizations...")
+    
+    # Visualize the network
+    plt_network = chess_net.visualize_network(max_nodes=50)
+    plt_network.savefig("chess_network.png")
+    
+    # Plot degree distribution
+    plt_degrees = chess_net.plot_degree_distribution()
+    plt_degrees.savefig("degree_distribution.png")
+    
+    # Plot community sizes
+    plt_communities = chess_net.plot_community_sizes()
+    if plt_communities:
+        plt_communities.savefig("community_sizes.png")
+    
+    # Plot heatmap
+    plt_heatmap = chess_net.plot_heatmap(metric='visits')
+    plt_heatmap.savefig("chess_heatmap.png")
+    
+    print("\nAnalysis complete. Visualizations saved as PNG files.")
